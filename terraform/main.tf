@@ -98,6 +98,11 @@ variable "db_password" {
 locals {
   name_safe = substr(lower(replace(replace(var.project_name, "_", "-"), " ", "-")), 0, 24)
   namespace = local.name_safe
+  effective_db_region    = var.azure_db_region != "" ? var.azure_db_region : var.azure_region
+  db_is_cross_region     = var.azure_db_region != "" && var.azure_db_region != var.azure_region
+  _db_name               = var.db_name != "" ? var.db_name : "${replace(var.project_name, "-", "_")}db"
+  _db_port               = "10255"
+  _db_scheme             = "mongodb"
 }
 
 resource "azurerm_resource_group" "rg" {
@@ -109,6 +114,19 @@ resource "azurerm_resource_group" "rg" {
   }
 }
 
+resource "azurerm_resource_group" "db_rg" {
+  count    = local.db_is_cross_region ? 1 : 0
+  name     = "${var.project_name}-db-rg"
+  location = var.azure_db_region
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
+}
+
+locals {
+  db_resource_group_name = local.db_is_cross_region ? azurerm_resource_group.db_rg[0].name : azurerm_resource_group.rg.name
+}
 
 resource "azurerm_kubernetes_cluster" "aks" {
   name                = "${var.project_name}-aks"
@@ -143,6 +161,52 @@ resource "azurerm_kubernetes_cluster" "aks" {
   }
 }
 
+# Azure Cosmos DB with MongoDB API — Azure's native managed Mongo product.
+# Free tier (`enable_free_tier = true`) covers 1000 RU/s + 25 GB; one Free
+# Tier per subscription. Server 4.2 is the latest stable Mongo wire version.
+resource "azurerm_cosmosdb_account" "db" {
+  name                = "${var.project_name}-cosmos"
+  resource_group_name = local.db_resource_group_name
+  location            = local.effective_db_region
+  offer_type          = "Standard"
+  kind                = "MongoDB"
+
+  capabilities {
+    name = "EnableMongo"
+  }
+  capabilities {
+    # Lets us use the modern Mongo wire protocol (matches MongoDB 4.0+).
+    name = "MongoDBv3.4"
+  }
+  capabilities {
+    name = "EnableServerless"
+  }
+
+  consistency_policy {
+    consistency_level = "Session"
+  }
+
+  geo_location {
+    location          = local.effective_db_region
+    failover_priority = 0
+  }
+
+  # Public network — Cosmos's firewall + key-based auth is the security layer.
+  # For private VNet ingress add `is_virtual_network_filter_enabled = true`
+  # plus a virtual_network_rule block (out of scope for the wizard default).
+  public_network_access_enabled = true
+
+  tags = {
+    Project   = var.project_name
+    ManagedBy = "udap"
+  }
+}
+
+resource "azurerm_cosmosdb_mongo_database" "appdb" {
+  name                = local._db_name
+  resource_group_name = local.db_resource_group_name
+  account_name        = azurerm_cosmosdb_account.db.name
+}
 
 output "cluster_name" {
   value = azurerm_kubernetes_cluster.aks.name
@@ -160,3 +224,27 @@ output "app_port" {
   value = var.app_port
 }
 
+# Cosmos DB returns a ready-made connection string that includes the primary
+# key as the password — emit it sensitively. Apps just read MONGO_URI.
+output "mongo_connection_string" {
+  value     = azurerm_cosmosdb_account.db.primary_mongodb_connection_string
+  sensitive = true
+}
+
+output "mongo_database" {
+  value = azurerm_cosmosdb_mongo_database.appdb.name
+}
+
+output "db_host" {
+  # cosmos.endpoint is https://...documents.azure.com:443 — strip the scheme/port
+  # for apps that build their own URI from host/db.
+  value = replace(replace(azurerm_cosmosdb_account.db.endpoint, "https://", ""), ":443/", "")
+}
+
+output "db_port" {
+  value = "10255"
+}
+
+output "db_name" {
+  value = local._db_name
+}

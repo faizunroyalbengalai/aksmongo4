@@ -60,6 +60,11 @@ jobs:
       resource_group: ${{ steps.tf_out.outputs.resource_group }}
       namespace:    ${{ steps.tf_out.outputs.namespace }}
       app_port:     ${{ steps.tf_out.outputs.app_port }}
+      db_host:      ${{ steps.tf_out.outputs.db_host }}
+      db_port:      ${{ steps.tf_out.outputs.db_port }}
+      db_name:      ${{ steps.tf_out.outputs.db_name }}
+      mongo_uri:    ${{ steps.tf_out.outputs.mongo_uri }}
+      mongo_database: ${{ steps.tf_out.outputs.mongo_database }}
     env:
       ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
       ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
@@ -130,6 +135,20 @@ jobs:
           echo "resource_group=${RG}"      >> $GITHUB_OUTPUT
           echo "namespace=${NS}"           >> $GITHUB_OUTPUT
           echo "app_port=${PORT}"          >> $GITHUB_OUTPUT
+          DB_HOST=$(terraform output -raw db_host 2>/dev/null || true)
+          DB_PORT=$(terraform output -raw db_port 2>/dev/null || true)
+          DB_NAME=$(terraform output -raw db_name 2>/dev/null || true)
+          echo "db_host=${DB_HOST}" >> $GITHUB_OUTPUT
+          echo "db_port=${DB_PORT}" >> $GITHUB_OUTPUT
+          echo "db_name=${DB_NAME}" >> $GITHUB_OUTPUT
+          # Cosmos DB returns a ready-made connection string with the primary
+          # key baked in (auth differs from Flexible Server's user/password).
+          # Mask before printing so it never leaks to the log.
+          MONGO_URI=$(terraform output -raw mongo_connection_string 2>/dev/null || true)
+          MONGO_DB=$(terraform output -raw mongo_database 2>/dev/null || true)
+          if [ -n "$MONGO_URI" ]; then echo "::add-mask::$MONGO_URI"; fi
+          echo "mongo_uri=${MONGO_URI}"   >> $GITHUB_OUTPUT
+          echo "mongo_database=${MONGO_DB}" >> $GITHUB_OUTPUT
           echo "AKS cluster: ${CLUSTER} (rg=${RG}, ns=${NS}, port=${PORT})"
 
   deploy:
@@ -205,6 +224,22 @@ jobs:
           ARGS+=(--from-literal=PORT=${{ needs.provision.outputs.app_port }})
           ARGS+=(--from-literal=NODE_ENV=production)
           ARGS+=(--from-literal=APP_ENV=production)
+          # Cosmos DB: the entire `mongodb://…` URI is the credential — Cosmos
+          # bakes the account's primary key into the connection string. We get
+          # it directly from Terraform's `mongo_connection_string` output
+          # (sensitive, already `::add-mask::`-ed by tf_out). Apps read MONGO_URI
+          # or DATABASE_URL — both point at the same Cosmos endpoint.
+          MONGO_URI="${{ needs.provision.outputs.mongo_uri }}"
+          MONGO_DB="${{ needs.provision.outputs.mongo_database }}"
+          [ -z "$MONGO_DB" ] && MONGO_DB="${{ steps.ids.outputs.db_name_default }}"
+          if [ -n "$MONGO_URI" ]; then
+            ARGS+=(--from-literal=DATABASE_URL="${MONGO_URI}")
+            ARGS+=(--from-literal=MONGO_URI="${MONGO_URI}")
+            ARGS+=(--from-literal=MONGODB_URI="${MONGO_URI}")
+          fi
+          [ -n "$MONGO_DB" ] && ARGS+=(--from-literal=DB_NAME="${MONGO_DB}")
+          [ -n "$MONGO_DB" ] && ARGS+=(--from-literal=MONGO_DB_NAME="${MONGO_DB}")
+          ARGS+=(--from-literal=DB_TYPE=mongodb)
           kubectl create secret generic "${PROJECT_LOWER}-env" \
             --namespace "$NS" \
             "${ARGS[@]}" \
