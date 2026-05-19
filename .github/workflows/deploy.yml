@@ -1,0 +1,315 @@
+name: Deploy — aksmongo4
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - run: npm install
+      - run: npm test --if-present
+
+  build_push:
+    name: Build & Push to GHCR
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Resolve image tag
+        id: meta
+        run: |
+          OWNER_LOWER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          PROJECT_LOWER=$(echo "aksmongo4" | tr '[:upper:]' '[:lower:]')
+          echo "image=ghcr.io/${OWNER_LOWER}/${PROJECT_LOWER}:${{ github.sha }}" >> $GITHUB_OUTPUT
+      - name: Build and push Docker image
+        run: |
+          docker build -t ${{ steps.meta.outputs.image }} .
+          docker push ${{ steps.meta.outputs.image }}
+
+  provision:
+    name: Provision AKS via Terraform
+    runs-on: ubuntu-latest
+    needs: build_push
+    outputs:
+      cluster_name: ${{ steps.tf_out.outputs.cluster_name }}
+      resource_group: ${{ steps.tf_out.outputs.resource_group }}
+      namespace:    ${{ steps.tf_out.outputs.namespace }}
+      app_port:     ${{ steps.tf_out.outputs.app_port }}
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate"
+      - name: Terraform plan
+        working-directory: terraform
+        env:
+          DB_NAME:     ${{ secrets.DB_NAME }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          EXTRA_ARGS=()
+          [ -n "$DB_NAME" ]     && EXTRA_ARGS+=(-var "db_name=$DB_NAME")
+          [ -n "$DB_USERNAME" ] && EXTRA_ARGS+=(-var "db_username=$DB_USERNAME")
+          [ -n "$DB_PASSWORD" ] && EXTRA_ARGS+=(-var "db_password=$DB_PASSWORD")
+          terraform plan \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="azure_region=${{ secrets.AZURE_REGION }}" \
+            -var="azure_db_region=${{ secrets.AZURE_DB_REGION }}" \
+            -var="container_image=${{ needs.build_push.outputs.image }}" \
+            -var="registry_server=ghcr.io" \
+            -var="registry_username=${{ github.actor }}" \
+            -var="registry_password=${{ secrets.GITHUB_TOKEN }}" \
+            "${EXTRA_ARGS[@]}" \
+            -out=tfplan
+      - name: Terraform apply
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+      - name: Capture Terraform outputs
+        id: tf_out
+        working-directory: terraform
+        run: |
+          # Print what terraform actually has so a missing output is visible
+          # in the log instead of silently becoming an empty string.
+          echo "::group::All Terraform outputs"
+          terraform output || true
+          echo "::endgroup::"
+
+          # Fallback values derived from the convention used by the Terraform
+          # template — if terraform output fails for any reason, the deploy
+          # can still find the cluster (RG="${project}-rg", AKS="${project}-aks").
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          CLUSTER=$(terraform output -raw cluster_name 2>/dev/null || echo "${PROJECT}-aks")
+          RG=$(terraform output -raw resource_group_name 2>/dev/null || echo "${PROJECT}-rg")
+          NS=$(terraform output -raw namespace 2>/dev/null || echo "$(echo "$PROJECT" | tr '[:upper:]' '[:lower:]' | cut -c1-24)")
+          PORT=$(terraform output -raw app_port 2>/dev/null || echo "3000")
+          # Ensure non-empty (terraform output -raw can succeed but emit "")
+          [ -z "$CLUSTER" ] && CLUSTER="${PROJECT}-aks"
+          [ -z "$RG" ]      && RG="${PROJECT}-rg"
+          [ -z "$NS" ]      && NS=$(echo "$PROJECT" | tr '[:upper:]' '[:lower:]' | cut -c1-24)
+          [ -z "$PORT" ]    && PORT="3000"
+
+          echo "cluster_name=${CLUSTER}"   >> $GITHUB_OUTPUT
+          echo "resource_group=${RG}"      >> $GITHUB_OUTPUT
+          echo "namespace=${NS}"           >> $GITHUB_OUTPUT
+          echo "app_port=${PORT}"          >> $GITHUB_OUTPUT
+          echo "AKS cluster: ${CLUSTER} (rg=${RG}, ns=${NS}, port=${PORT})"
+
+  deploy:
+    name: Deploy to AKS (kubectl)
+    runs-on: ubuntu-latest
+    needs: [build_push, provision]
+    outputs:
+      url: ${{ steps.ingress.outputs.url }}
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          # Use latest stable client — kubectl is forward-compatible one
+          # minor version, so this works with whatever AKS default version
+          # Azure picks at provision time.
+          version: 'latest'
+      - name: Azure login
+        uses: azure/login@v2
+        with:
+          creds: '{"clientId":"${{ secrets.ARM_CLIENT_ID }}","clientSecret":"${{ secrets.ARM_CLIENT_SECRET }}","subscriptionId":"${{ secrets.ARM_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.ARM_TENANT_ID }}"}'
+      - name: Get AKS credentials
+        # Build cluster/RG names from secrets.PROJECT_NAME at action-input time
+        # rather than via needs.provision.outputs.*: GitHub Actions masks
+        # `***` over any value containing PROJECT_NAME (a registered secret),
+        # then drops masked outputs when passing between jobs, leaving the
+        # downstream `with:` inputs empty. Direct secret reference doesn't
+        # have that problem — secrets pass cleanly into action inputs.
+        uses: azure/aks-set-context@v4
+        with:
+          resource-group: ${{ secrets.PROJECT_NAME }}-rg
+          cluster-name:   ${{ secrets.PROJECT_NAME }}-aks
+          admin: 'true'
+      - name: Compute job-local identifiers
+        # Cross-job step outputs that contain a masked secret get dropped by
+        # GitHub Actions. PROJECT_NAME is a registered secret, so anything
+        # derived from it (namespace, db_host, …) hits this trap when passed
+        # via needs.<job>.outputs.<x>. We rebuild locally inside this job's
+        # shell — secrets inlined into `run:` scripts ARE expanded fine.
+        id: ids
+        run: |
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          PROJECT_LOWER=$(echo "$PROJECT" | tr '[:upper:]' '[:lower:]')
+          NS=$(echo "$PROJECT_LOWER" | cut -c1-24)
+          DB_NAME_SAFE=$(echo "$PROJECT" | tr '-' '_')
+          {
+            echo "project_lower=${PROJECT_LOWER}"
+            echo "namespace=${NS}"
+            echo "db_name_default=${DB_NAME_SAFE}db"
+          } >> $GITHUB_OUTPUT
+      - name: Create namespace
+        run: |
+          kubectl create namespace "${{ steps.ids.outputs.namespace }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Create GHCR pull secret
+        run: |
+          kubectl create secret docker-registry ghcr-pull-secret \
+            --namespace "${{ steps.ids.outputs.namespace }}" \
+            --docker-server=ghcr.io \
+            --docker-username="${{ github.actor }}" \
+            --docker-password="${{ secrets.GITHUB_TOKEN }}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Create app env secret
+        run: |
+          NS="${{ steps.ids.outputs.namespace }}"
+          PROJECT_LOWER="${{ steps.ids.outputs.project_lower }}"
+          ARGS=()
+          ARGS+=(--from-literal=PORT=${{ needs.provision.outputs.app_port }})
+          ARGS+=(--from-literal=NODE_ENV=production)
+          ARGS+=(--from-literal=APP_ENV=production)
+          kubectl create secret generic "${PROJECT_LOWER}-env" \
+            --namespace "$NS" \
+            "${ARGS[@]}" \
+            --dry-run=client -o yaml | kubectl apply -f -
+      - name: Apply Kubernetes manifests
+        run: |
+          NS="${{ steps.ids.outputs.namespace }}"
+          PROJECT_LOWER="${{ steps.ids.outputs.project_lower }}"
+          IMAGE="${{ needs.build_push.outputs.image }}"
+          APP_PORT="${{ needs.provision.outputs.app_port }}"
+          HEALTH_PATH="/health"
+          INIT_DELAY="30"
+          kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: ${PROJECT_LOWER}
+            namespace: ${NS}
+            labels:
+              app: ${PROJECT_LOWER}
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: ${PROJECT_LOWER}
+            strategy:
+              type: RollingUpdate
+              rollingUpdate:
+                maxSurge: 1
+                maxUnavailable: 0
+            template:
+              metadata:
+                labels:
+                  app: ${PROJECT_LOWER}
+              spec:
+                imagePullSecrets:
+                  - name: ghcr-pull-secret
+                containers:
+                  - name: ${PROJECT_LOWER}
+                    image: ${IMAGE}
+                    ports:
+                      - containerPort: ${APP_PORT}
+                    envFrom:
+                      - secretRef:
+                          name: ${PROJECT_LOWER}-env
+                    resources:
+                      requests:
+                        cpu: "250m"
+                        memory: "256Mi"
+                      limits:
+                        cpu: "500m"
+                        memory: "512Mi"
+                    readinessProbe:
+                      httpGet:
+                        path: ${HEALTH_PATH}
+                        port: ${APP_PORT}
+                      initialDelaySeconds: ${INIT_DELAY}
+                      periodSeconds: 10
+                      failureThreshold: 3
+          ---
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: ${PROJECT_LOWER}
+            namespace: ${NS}
+          spec:
+            selector:
+              app: ${PROJECT_LOWER}
+            ports:
+              - port: 80
+                targetPort: ${APP_PORT}
+            type: LoadBalancer
+          EOF
+      - name: Wait for rollout
+        run: |
+          NS="${{ steps.ids.outputs.namespace }}"
+          PROJECT_LOWER="${{ steps.ids.outputs.project_lower }}"
+          if ! kubectl rollout status deployment/${PROJECT_LOWER} \
+               -n "$NS" --timeout=300s; then
+            echo "--- Pod status ---"
+            kubectl get pods -n "$NS" -l app="${PROJECT_LOWER}"
+            echo "--- Pod events ---"
+            kubectl describe pods -n "$NS" -l app="${PROJECT_LOWER}" | tail -40
+            echo "--- Pod logs (last 50 lines) ---"
+            kubectl logs -n "$NS" -l app="${PROJECT_LOWER}" --tail=50 2>/dev/null || true
+            echo "Rollout timed out — continuing to expose URL anyway"
+          fi
+      - name: Get LoadBalancer IP
+        id: ingress
+        run: |
+          NS="${{ steps.ids.outputs.namespace }}"
+          PROJECT_LOWER="${{ steps.ids.outputs.project_lower }}"
+          echo "Waiting for LoadBalancer IP to be assigned..."
+          for i in $(seq 1 30); do
+            IP=$(kubectl get service "${PROJECT_LOWER}" -n "$NS" \
+              -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "")
+            if [ -n "$IP" ]; then
+              echo "url=http://${IP}" >> $GITHUB_OUTPUT
+              echo "LoadBalancer IP: ${IP}"
+              break
+            fi
+            echo "Attempt ${i}/30 — LoadBalancer not ready yet, waiting 20s..."
+            sleep 20
+          done
+          if [ -z "$IP" ]; then
+            echo "LoadBalancer IP not assigned within timeout — check Azure portal"
+            echo "url=" >> $GITHUB_OUTPUT
+          fi

@@ -1,0 +1,97 @@
+name: Destroy — aksmongo4
+
+on:
+  workflow_dispatch:
+
+env:
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+jobs:
+  cleanup_k8s:
+    name: Clean Kubernetes resources
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+      - name: Azure login
+        id: azlogin
+        uses: azure/login@v2
+        continue-on-error: true
+        with:
+          creds: '{"clientId":"${{ secrets.ARM_CLIENT_ID }}","clientSecret":"${{ secrets.ARM_CLIENT_SECRET }}","subscriptionId":"${{ secrets.ARM_SUBSCRIPTION_ID }}","tenantId":"${{ secrets.ARM_TENANT_ID }}"}'
+      - name: Get AKS credentials
+        id: kubectx
+        if: steps.azlogin.outcome == 'success'
+        uses: azure/aks-set-context@v4
+        continue-on-error: true
+        with:
+          resource-group: ${{ secrets.PROJECT_NAME }}-rg
+          cluster-name:   ${{ secrets.PROJECT_NAME }}-aks
+          admin: 'true'
+      - name: Delete Service / Deployment before Terraform destroys the cluster
+        if: steps.kubectx.outcome == 'success'
+        run: |
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          PROJECT_LOWER=$(echo "$PROJECT" | tr '[:upper:]' '[:lower:]')
+          NS=$(echo "$PROJECT_LOWER" | cut -c1-24)
+          # LoadBalancer Service must be deleted first so Azure can deprovision
+          # the public IP — otherwise the VNet/NSG destroy fails.
+          kubectl delete service "${PROJECT_LOWER}" -n "$NS" --ignore-not-found || true
+          kubectl delete deployment "${PROJECT_LOWER}" -n "$NS" --ignore-not-found || true
+          sleep 30
+
+  destroy:
+    name: Terraform Destroy
+    runs-on: ubuntu-latest
+    needs: cleanup_k8s
+    env:
+      ARM_CLIENT_ID:       ${{ secrets.ARM_CLIENT_ID }}
+      ARM_CLIENT_SECRET:   ${{ secrets.ARM_CLIENT_SECRET }}
+      ARM_TENANT_ID:       ${{ secrets.ARM_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ secrets.ARM_SUBSCRIPTION_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Terraform init
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="resource_group_name=${{ secrets.TF_STATE_RG }}" \
+            -backend-config="storage_account_name=${{ secrets.TF_STATE_STORAGE }}" \
+            -backend-config="container_name=${{ secrets.TF_STATE_CONTAINER }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}.tfstate"
+      - name: Terraform destroy
+        working-directory: terraform
+        env:
+          DB_NAME:     ${{ secrets.DB_NAME }}
+          DB_USERNAME: ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+        run: |
+          # DB variables must be passed even during destroy — Terraform validates
+          # the resource config (e.g. non-empty administrator_password) before
+          # planning the deletion. Use stored secrets when set, placeholders
+          # otherwise so the workflow stays runnable without them.
+          EXTRA_ARGS=()
+          EXTRA_ARGS+=(-var "db_name=${DB_NAME:-destroy}")
+          EXTRA_ARGS+=(-var "db_username=${DB_USERNAME:-destroy}")
+          EXTRA_ARGS+=(-var "db_password=${DB_PASSWORD:-destroy-placeholder-pw}")
+          terraform destroy -auto-approve \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="azure_region=${{ secrets.AZURE_REGION }}" \
+            -var="azure_db_region=${{ secrets.AZURE_DB_REGION }}" \
+            -var="container_image=placeholder:destroy" \
+            -var="registry_server=ghcr.io" \
+            -var="registry_username=destroy" \
+            -var="registry_password=destroy" \
+            "${EXTRA_ARGS[@]}"
